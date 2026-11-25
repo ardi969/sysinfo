@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# sysinfo — laporan sistem satu halaman: OS, CPU, RAM, disk, jaringan.
+# Output manusia (berwarna kalau ke terminal) atau JSON dengan --json.
+# Hanya membaca; tidak mengubah apa pun di sistem.
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ---------------- opsi ----------------
+FORMAT="human"
+SECTION="all"
+USE_COLOR=""   # kosong = otomatis (warna hanya ke terminal), 1 = paksa, 0 = mati
+
+usage() {
+    cat <<'EOF'
+Penggunaan: sysinfo [OPSI]
+
+Laporan sistem satu halaman — OS, kernel, CPU, RAM, disk, jaringan.
+
+Opsi:
+  --json                output JSON (satu objek, enak buat scripting)
+  --section NAMA        tampilkan satu seksi saja:
+                        os, cpu, mem, disk, net, all (default: all)
+  --no-color            matikan warna di output manusia
+  --color               paksa warna meski output di-pipe
+  -h, --help            tampilkan bantuan ini
+  --version             tampilkan versi
+
+Contoh:
+  sysinfo                          # semua seksi, format manusia
+  sysinfo --json                   # semua seksi sebagai JSON
+  sysinfo --section mem --json     # hanya memori, JSON
+  sysinfo --section disk           # hanya disk
+EOF
+}
+
+# ---------------- util ----------------
+# Format byte jadi human-readable (1024-based, 1 desimal).
+human_bytes() {
+    awk -v b="$1" 'BEGIN {
+        split("B KiB MiB GiB TiB PiB", u)
+        i = 1
+        while (b >= 1024 && i < 6) { b /= 1024; i++ }
+        if (i == 1) printf "%d %s", b, u[i]
+        else printf "%.1f %s", b, u[i]
+    }'
+}
+
+# Escape string untuk JSON (tanpa dependensi eksternal).
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\t'/\\t}
+    s=${s//$'\r'/\\r}
+    printf '%s' "$s"
+}
+
+# Uptime cantik dari /proc/uptime (fallback kalau `uptime -p` tidak ada).
+pretty_uptime() {
+    if command -v uptime >/dev/null 2>&1; then
+        local u
+        u=$(uptime -p 2>/dev/null || true)
+        if [[ -n "$u" ]]; then
+            printf '%s' "${u#up }"
+            return 0
+        fi
+    fi
+    local secs
+    secs=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
+    local d=$((secs / 86400)) h=$((secs % 86400 / 3600)) m=$((secs % 3600 / 60))
+    local out=""
+    (( d > 0 )) && out+="${d}d "
+    (( h > 0 )) && out+="${h}h "
+    out+="${m}m"
+    printf '%s' "$out"
+}
+
+# ---------------- pengumpulan data ----------------
+# OS
+OS_NAME="unknown"
+OS_KERNEL="unknown"
+OS_ARCH="unknown"
+OS_HOSTNAME="unknown"
+OS_UPTIME="unknown"
+
+gather_os() {
+    OS_HOSTNAME=$(hostname 2>/dev/null || echo unknown)
+    OS_KERNEL=$(uname -r 2>/dev/null || echo unknown)
+    OS_ARCH=$(uname -m 2>/dev/null || echo unknown)
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        OS_NAME=${PRETTY_NAME:-${NAME:-unknown}}
+    fi
+    OS_UPTIME=$(pretty_uptime)
+}
+
+# CPU
+CPU_MODEL="unknown"
+CPU_CORES=0
+CPU_LOAD="unknown"
+
+gather_cpu() {
+    if [[ -r /proc/cpuinfo ]]; then
+        CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null \
+            | cut -d: -f2- | sed 's/^ *//' || true)
+    fi
+    if [[ -z "$CPU_MODEL" ]] && command -v lscpu >/dev/null 2>&1; then
+        CPU_MODEL=$(lscpu 2>/dev/null | awk -F: '/^Model name/ {sub(/^ +/,"",$2); print $2; exit}' || true)
+    fi
+    [[ -z "$CPU_MODEL" ]] && CPU_MODEL="unknown"
+    if command -v nproc >/dev/null 2>&1; then
+        CPU_CORES=$(nproc 2>/dev/null || echo 0)
+    fi
+    if [[ -r /proc/loadavg ]]; then
+        CPU_LOAD=$(awk '{print $1", "$2", "$3}' /proc/loadavg)
+    fi
+}
+
+# Memori (angka mentah dalam KiB, dari /proc/meminfo)
+MEM_TOTAL_KB=0
+MEM_AVAIL_KB=0
+MEM_FREE_KB=0
+SWAP_TOTAL_KB=0
+SWAP_FREE_KB=0
+
+gather_mem() {
+    local key val
+    while read -r key val _; do
+        case "$key" in
+            MemTotal:)     MEM_TOTAL_KB=$val ;;
+            MemAvailable:) MEM_AVAIL_KB=$val ;;
+            MemFree:)      MEM_FREE_KB=$val ;;
+            SwapTotal:)    SWAP_TOTAL_KB=$val ;;
+            SwapFree:)     SWAP_FREE_KB=$val ;;
+        esac
+    done < /proc/meminfo
+}
+
+# Disk — array per filesystem (tmpfs/devtmpfs dilewati).
+declare -a DISK_MOUNT=() DISK_SIZE=() DISK_USED=() DISK_AVAIL=() DISK_PCT=()
+
+gather_disk() {
+    local fstype mount size used avail pct
+    while read -r fstype mount size used avail pct; do
+        case "$fstype" in
+            tmpfs|devtmpfs) continue ;;
+        esac
+        DISK_MOUNT+=("$mount")
+        DISK_SIZE+=("$size")
+        DISK_USED+=("$used")
+        DISK_AVAIL+=("$avail")
+        DISK_PCT+=("$pct")
+    done < <(df -B1 --output=fstype,target,size,used,avail,pcent 2>/dev/null | tail -n +2)
+}
+
+# Jaringan — array interface + alamat IPv4.
+declare -a NET_IFACE=() NET_ADDR=()
+
+gather_net() {
+    local iface addr
+    if command -v ip >/dev/null 2>&1; then
+        while read -r iface addr _; do
+            [[ "$iface" == "lo" ]] && continue
+            NET_IFACE+=("$iface")
+            NET_ADDR+=("$addr")
+        done < <(ip -4 -brief addr 2>/dev/null | awk 'NF>=3 {print $1, $3}')
+    fi
+    if [[ ${#NET_IFACE[@]} -eq 0 ]] && command -v hostname >/dev/null 2>&1; then
+        # Fallback: hostname -I tidak memberi nama interface.
+        local ip_list
+        ip_list=$(hostname -I 2>/dev/null || true)
+        if [[ -n "$ip_list" ]]; then
+            for addr in $ip_list; do
+                NET_IFACE+=("-")
+                NET_ADDR+=("$addr")
+            done
+        fi
+    fi
+}
+
+# ---------------- output manusia ----------------
+BOLD="" RESET="" CYAN=""
+
+print_header() {
+    printf '%s%s== %s ==%s\n' "$BOLD" "$CYAN" "$1" "$RESET"
+}
+
+print_kv() {
+    printf '  %-14s %s\n' "$1" "$2"
+}
+
+output_human_os() {
+    print_header "Sistem Operasi"
+    print_kv "Hostname:" "$OS_HOSTNAME"
+    print_kv "OS:" "$OS_NAME"
+    print_kv "Kernel:" "$OS_KERNEL"
+    print_kv "Arsitektur:" "$OS_ARCH"
+    print_kv "Uptime:" "$OS_UPTIME"
+}
+
+output_human_cpu() {
+    print_header "CPU"
+    print_kv "Model:" "$CPU_MODEL"
+    print_kv "Core:" "$CPU_CORES"
+    print_kv "Load avg:" "$CPU_LOAD"
+}
+
+output_human_mem() {
+    local used_kb=$((MEM_TOTAL_KB - MEM_AVAIL_KB))
+    local swap_used_kb=$((SWAP_TOTAL_KB - SWAP_FREE_KB))
+    print_header "Memori"
+    print_kv "RAM total:" "$(human_bytes $((MEM_TOTAL_KB * 1024)))"
+    print_kv "RAM terpakai:" "$(human_bytes $((used_kb * 1024)))"
+    print_kv "RAM tersedia:" "$(human_bytes $((MEM_AVAIL_KB * 1024)))"
+    print_kv "RAM bebas:" "$(human_bytes $((MEM_FREE_KB * 1024)))"
+    print_kv "Swap total:" "$(human_bytes $((SWAP_TOTAL_KB * 1024)))"
+    print_kv "Swap terpakai:" "$(human_bytes $((swap_used_kb * 1024)))"
+}
+
+output_human_disk() {
+    print_header "Disk"
+    printf '  %-20s %10s %10s %10s %6s\n' "MOUNT" "TOTAL" "TERPAKAI" "TERSEDIA" "PAKAI"
+    local i
+    for i in "${!DISK_MOUNT[@]}"; do
+        printf '  %-20s %10s %10s %10s %6s\n' \
+            "${DISK_MOUNT[$i]}" \
+            "$(human_bytes "${DISK_SIZE[$i]}")" \
+            "$(human_bytes "${DISK_USED[$i]}")" \
+            "$(human_bytes "${DISK_AVAIL[$i]}")" \
+            "${DISK_PCT[$i]}"
+    done
+}
+
+output_human_net() {
+    print_header "Jaringan"
+    local i
+    if [[ ${#NET_IFACE[@]} -eq 0 ]]; then
+        print_kv "IPv4:" "(tidak ada interface dengan alamat IPv4)"
+        return 0
+    fi
+    for i in "${!NET_IFACE[@]}"; do
+        print_kv "${NET_IFACE[$i]}:" "${NET_ADDR[$i]}"
+    done
+}
+
+output_human() {
+    case "$SECTION" in
+        all)  output_human_os; output_human_cpu; output_human_mem; output_human_disk; output_human_net ;;
+        os)   output_human_os ;;
+        cpu)  output_human_cpu ;;
+        mem)  output_human_mem ;;
+        disk) output_human_disk ;;
+        net)  output_human_net ;;
+    esac
+}
+
+# ---------------- output JSON ----------------
+output_json_os() {
+    printf '  "os": {"hostname": "%s", "name": "%s", "kernel": "%s", "arch": "%s", "uptime": "%s"}' \
+        "$(json_escape "$OS_HOSTNAME")" "$(json_escape "$OS_NAME")" \
+        "$(json_escape "$OS_KERNEL")" "$(json_escape "$OS_ARCH")" \
+        "$(json_escape "$OS_UPTIME")"
+}
+
+output_json_cpu() {
+    printf '  "cpu": {"model": "%s", "cores": %s, "load_avg": "%s"}' \
+        "$(json_escape "$CPU_MODEL")" "$CPU_CORES" "$(json_escape "$CPU_LOAD")"
+}
+
+output_json_mem() {
+    local used_kb=$((MEM_TOTAL_KB - MEM_AVAIL_KB))
+    local swap_used_kb=$((SWAP_TOTAL_KB - SWAP_FREE_KB))
+    printf '  "mem": {"total_bytes": %s, "used_bytes": %s, "available_bytes": %s, "free_bytes": %s, "swap_total_bytes": %s, "swap_used_bytes": %s}' \
+        "$((MEM_TOTAL_KB * 1024))" "$((used_kb * 1024))" "$((MEM_AVAIL_KB * 1024))" "$((MEM_FREE_KB * 1024))" \
+        "$((SWAP_TOTAL_KB * 1024))" "$((swap_used_kb * 1024))"
+}
+
+output_json_disk() {
+    printf '  "disk": ['
+    local i
+    for i in "${!DISK_MOUNT[@]}"; do
+        (( i > 0 )) && printf ', '
+        printf '{"mount": "%s", "size_bytes": %s, "used_bytes": %s, "available_bytes": %s, "use_percent": "%s"}' \
+            "$(json_escape "${DISK_MOUNT[$i]}")" "${DISK_SIZE[$i]}" \
+            "${DISK_USED[$i]}" "${DISK_AVAIL[$i]}" "$(json_escape "${DISK_PCT[$i]}")"
+    done
+    printf ']'
+}
+
+output_json_net() {
+    printf '  "net": ['
+    local i
+    for i in "${!NET_IFACE[@]}"; do
+        (( i > 0 )) && printf ', '
+        printf '{"interface": "%s", "ipv4": "%s"}' \
+            "$(json_escape "${NET_IFACE[$i]}")" "$(json_escape "${NET_ADDR[$i]}")"
+    done
+    printf ']'
+}
+
+output_json() {
+    printf '{\n'
+    local first=1
+    emit() {
+        (( first == 0 )) && printf ',\n'
+        first=0
+        "$1"
+    }
+    case "$SECTION" in
+        all)  emit output_json_os; emit output_json_cpu; emit output_json_mem; emit output_json_disk; emit output_json_net ;;
+        os)   emit output_json_os ;;
+        cpu)  emit output_json_cpu ;;
+        mem)  emit output_json_mem ;;
+        disk) emit output_json_disk ;;
+        net)  emit output_json_net ;;
+    esac
+    printf '\n}\n'
+}
+
+# ---------------- main ----------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)       FORMAT="json"; shift ;;
+        --section)
+            [[ $# -lt 2 ]] && { echo "sysinfo: --section butuh nilai" >&2; exit 2; }
+            SECTION="$2"; shift 2 ;;
+        --section=*) SECTION="${1#--section=}"; shift ;;
+        --no-color)   USE_COLOR=0; shift ;;
+        --color)      USE_COLOR=1; shift ;;
+        -h|--help)    usage; exit 0 ;;
+        --version)    echo "sysinfo $VERSION"; exit 0 ;;
+        *)            echo "sysinfo: opsi tidak dikenal: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+case "$SECTION" in
+    all|os|cpu|mem|disk|net) ;;
+    *) echo "sysinfo: --section tidak valid: $SECTION (pilih: os, cpu, mem, disk, net, all)" >&2; exit 2 ;;
+esac
+
+# Warna: dipaksa --color, dimatikan --no-color, defaultnya hanya ke terminal.
+if [[ "$FORMAT" == "human" ]]; then
+    if [[ "$USE_COLOR" == "1" ]] || { [[ -z "$USE_COLOR" ]] && [[ -t 1 ]]; }; then
+        BOLD=$'\033[1m'; RESET=$'\033[0m'; CYAN=$'\033[36m'
+    fi
+fi
+
+gather_os
+gather_cpu
+gather_mem
+gather_disk
+gather_net
+
+if [[ "$FORMAT" == "json" ]]; then
+    output_json
+else
+    output_human
+fi
